@@ -341,6 +341,8 @@ export const api = {
   lock: () => invoke<void>("vault_lock"),
   changePassword: (old: string, nw: string) => invoke<void>("vault_change_password", { old, new: nw }),
   startPasswordGet: () => invoke<boolean>("start_password_get"),
+  /** "windows", "linux" o "macos". */
+  platform: () => invoke<string>("platform"),
   startPasswordSet: (ask: boolean, password: string | null) => invoke<void>("start_password_set", { ask, password }),
   touch: () => invoke<void>("touch"),
   snapshot: () => invoke<Snapshot>("snapshot"),

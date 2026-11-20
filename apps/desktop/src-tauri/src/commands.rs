@@ -73,6 +73,12 @@ pub async fn vault_change_password(s: State<'_, AppState>, old: String, new: Str
     Ok(())
 }
 
+/// El sistema operativo ("windows", "linux", "macos"), para lo que la interfaz muestra o no.
+#[tauri::command]
+pub fn platform() -> &'static str {
+    std::env::consts::OS
+}
+
 /// Si pide la contrasena maestra al arrancar Ethereon (ver remember.rs).
 #[tauri::command]
 pub fn start_password_get(s: State<AppState>) -> bool {

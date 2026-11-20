@@ -52,12 +52,14 @@ impl TftpServer {
         if !dir.is_dir() {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} is not a folder", dir.display())));
         }
-        let sock = UdpSocket::bind(("0.0.0.0", port)).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                std::io::Error::new(e.kind(), format!("port {port} is in use (is another TFTP server like Tftpd64 running?)"))
-            } else {
-                e
-            }
+        let sock = UdpSocket::bind(("0.0.0.0", port)).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => std::io::Error::new(e.kind(), format!("port {port} is in use (is another TFTP server like Tftpd64 running?)")),
+            // Linux y Mac: los puertos de menos de 1024 son solo para root.
+            std::io::ErrorKind::PermissionDenied if port < 1024 => std::io::Error::new(
+                e.kind(),
+                format!("port {port} needs root on this system: use a port above 1024 (6969 is common), or allow it once with `sudo setcap cap_net_bind_service=+ep <path to ethereon>`"),
+            ),
+            _ => e,
         })?;
         let port = sock.local_addr()?.port();
         let root = dir.clone();

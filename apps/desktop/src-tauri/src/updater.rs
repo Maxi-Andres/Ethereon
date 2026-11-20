@@ -183,8 +183,17 @@ pub async fn apply(app: &AppHandle) {
     }
     crate::save_config(app);
     state.broker.lock().await;
+    #[cfg(windows)]
     spawn_relaunch_watchdog();
-    if let Err(e) = update.install(&bytes) {
+    let res = update.install(&bytes);
+    // En Windows el instalador (NSIS) cierra la app y la vuelve a abrir. En Linux se
+    // reemplaza el AppImage (o se instala el .deb) y la app sigue abierta con lo viejo: se
+    // reinicia sola.
+    #[cfg(not(windows))]
+    if res.is_ok() {
+        app.restart();
+    }
+    if let Err(e) = res {
         if let Some(path) = relaunch_path(app) {
             let _ = std::fs::remove_file(path);
         }
@@ -199,7 +208,8 @@ pub async fn apply(app: &AppHandle) {
 /// Respaldo por si el instalador no vuelve a abrir la app (lo hace "como el usuario del
 /// escritorio" y eso puede fallar, por ejemplo en una sesion remota desconectada). Un
 /// PowerShell oculto espera a que se reemplace el ejecutable y, si Ethereon no arranco
-/// sola, la abre con los mismos argumentos.
+/// sola, la abre con los mismos argumentos. Solo Windows.
+#[cfg(windows)]
 fn spawn_relaunch_watchdog() {
     let Ok(exe) = std::env::current_exe() else { return };
     let args: Vec<String> = std::env::args().skip(1).map(|a| format!("'{}'", a.replace('\'', "''"))).collect();

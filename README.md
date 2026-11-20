@@ -4,12 +4,13 @@
 [![Release](https://img.shields.io/github/v/release/MartinSchubert04/Ethereon)](https://github.com/MartinSchubert04/Ethereon/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/MartinSchubert04/Ethereon/total)](https://github.com/MartinSchubert04/Ethereon/releases)
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows)
+![Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri)
 ![Svelte 5](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte)
 ![Rust](https://img.shields.io/badge/Rust-black?logo=rust)
 ![MCP](https://img.shields.io/badge/MCP-Claude%20Code-D97757?logo=anthropic)
 
-A Termius-style SSH manager for Windows that also gives Claude Code access without handing it any
+A Termius-style SSH manager for Windows and Linux that also gives Claude Code access without handing it any
 credential. It sits in the tray and is lightweight with the window closed.
 
 ![Ethereon with the Poolsuite FM theme, Monochrome palette](docs/screenshot.png)
@@ -94,7 +95,12 @@ The token is shown only once; Ethereon stores only its hash. It can be revoked i
 
 ## Development
 
-Requires Rust (with the Visual Studio Build Tools) and Node 22 or newer.
+Requires Rust and Node 22 or newer. On Windows, also the Visual Studio Build Tools (C++). On Linux
+(Ubuntu / Debian):
+
+```
+sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev build-essential file
+```
 
 ```
 npm install
@@ -116,8 +122,19 @@ To test without touching the real vault:
 - `ETHEREON_DATA_DIR=<folder>` uses a different data folder.
 - `ETHEREON_PORT=<port>` changes the MCP port (47321 by default, or whatever `config.json` says).
 
-Data lives in `%APPDATA%\app.ethereon.ssh`: `vault.json` (encrypted), `audit.jsonl` and `config.json`
-(port and window position).
+Data lives in `%APPDATA%\app.ethereon.ssh` (Windows) or `~/.local/share/app.ethereon.ssh` (Linux):
+`vault.json` (encrypted), `audit.jsonl` and `config.json` (port and window position).
+
+### Linux notes
+
+- Install the `.deb` (Ubuntu / Debian) or run the `.AppImage` (any distro). Both update themselves.
+- Serial consoles: your user has to be in the `dialout` group (`sudo usermod -aG dialout $USER`,
+  then log in again).
+- Ping and traceroute use unprivileged ICMP sockets, allowed by `net.ipv4.ping_group_range` (on by
+  default in Ubuntu, Debian and Fedora).
+- The TFTP server can't use port 69 without root: pick a port above 1024 (6969 is common).
+- Not on Linux (yet): opening the vault at start without the password (it uses Windows DPAPI) and the
+  frosted-glass window.
 
 ## Publishing a version
 
@@ -126,8 +143,9 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The tag triggers `.github/workflows/desktop.yml`: it builds the installer, signs it and publishes it to the
-Release along with `latest.json`. Installed apps check that file a minute after starting and every 6
+The tag triggers `.github/workflows/desktop.yml`: it builds the installers (Windows `setup.exe`, Linux
+`.deb` and `.AppImage`), signs them and publishes them to the Release along with `latest.json`, which
+lists every platform. Installed apps check that file a minute after starting and every 6
 hours, download the new version in the background and install it on their own when the window is closed, the vault
 locked and no agent commands are running (updating restarts the app and the vault ends up
 locked). If that doesn't happen, **Update** appears in the top bar.

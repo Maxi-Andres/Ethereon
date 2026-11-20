@@ -11,6 +11,8 @@ TAG="$GITHUB_REF_NAME"
 cat > notas.md <<NOTAS
 **Windows:** bajá \`Ethereon-$V-setup.exe\` y abrilo. Se instala solo para tu usuario, sin pedir permisos de administrador.
 
+**Linux:** en Ubuntu / Debian, \`sudo apt install ./Ethereon-$V-amd64.deb\`. En cualquier otra distro, el \`Ethereon-$V-amd64.AppImage\`: \`chmod +x\` y abrilo. Para la consola serie tu usuario tiene que estar en el grupo \`dialout\`.
+
 Si ya tenés Ethereon, no hace falta: se actualiza sola cuando no la estás usando (o con **Update** en la barra de arriba).
 NOTAS
 

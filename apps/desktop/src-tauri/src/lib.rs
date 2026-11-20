@@ -310,6 +310,7 @@ pub fn run() {
             commands::vault_lock,
             commands::vault_change_password,
             commands::start_password_get,
+            commands::platform,
             commands::start_password_set,
             commands::touch,
             commands::snapshot,

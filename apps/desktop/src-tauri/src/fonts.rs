@@ -48,6 +48,20 @@ pub fn system_fonts() -> Vec<String> {
             }
         }
     }
+    // Linux: las familias de fontconfig ("DejaVu Sans,DejaVu Sans Condensed" por linea).
+    #[cfg(not(windows))]
+    {
+        if let Ok(o) = std::process::Command::new("fc-list").args([":", "family"]).output() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                for f in line.split(',') {
+                    let f = f.trim().replace("\\-", "-");
+                    if !f.is_empty() && !f.starts_with('.') {
+                        out.insert(f);
+                    }
+                }
+            }
+        }
+    }
     out.into_iter().collect()
 }
 

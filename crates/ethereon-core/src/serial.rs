@@ -89,6 +89,15 @@ pub fn open(cfg: &SerialConfig) -> io::Result<Box<dyn Link>> {
                 let busy = matches!(e.kind, serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied))
                     || e.description.to_lowercase().contains("denied")
                     || e.description.to_lowercase().contains("busy");
+                // En Linux, "permiso denegado" casi siempre es que el usuario no esta en el
+                // grupo que puede usar los puertos serie, no que otro lo tenga abierto.
+                #[cfg(target_os = "linux")]
+                if matches!(e.kind, serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied)) || e.description.to_lowercase().contains("permission denied") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("no permission to open {}: add your user to the dialout group (`sudo usermod -aG dialout $USER`) and log in again", cfg.port.trim()),
+                    ));
+                }
                 last = Some(io::Error::from(e));
                 if !busy {
                     break;

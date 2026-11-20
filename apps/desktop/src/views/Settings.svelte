@@ -70,6 +70,9 @@
   let startPw = $state("");
   let confirmingStart = $state(false);
   api.startPasswordGet().then((v) => (askAtStart = v)).catch(() => {});
+  // Guardar la clave para abrir solo usa DPAPI: solo Windows (ver remember.rs).
+  let canRemember = $state(false);
+  api.platform().then((p) => (canRemember = p === "windows")).catch(() => {});
 
   async function toggleAskAtStart(v: boolean) {
     if (!v) return (confirmingStart = true);
@@ -335,9 +338,11 @@
         <div class="chk"><Switch bind:checked={s.audit_output}>Save the (masked) output in the audit log, not only its hash</Switch></div>
       </div>
       <div><button class="btn primary" onclick={saveSettings}>Save</button></div>
+      {#if canRemember}
       <div class="sub">Startup</div>
       <Switch bind:checked={askAtStart} onchange={toggleAskAtStart}>Ask for the master password when Ethereon starts</Switch>
-      {#if confirmingStart}
+      {/if}
+      {#if !canRemember}{:else if confirmingStart}
         <label class="field">Master password
           <input type="password" bind:value={startPw} onkeydown={(e) => e.key === "Enter" && startPw && stopAsking()} />
           <span class="hint">Windows keeps the vault key for your user, so the vault opens by itself after a restart. Any program you run, Claude Code included, could use it to open the vault.</span>

@@ -1,8 +1,10 @@
 name: Escritorio
 
-# - En cada push y PR que toque algo de escritorio: tests de Rust y chequeo de tipos.
-# - Al etiquetar vX.Y.Z: compila el instalador de Windows, lo firma y lo publica en el
-#   Release de esa version junto con latest.json (lo que consultan las apps instaladas).
+# - En cada push y PR que toque algo de escritorio: tests de Rust y chequeo de tipos, en
+#   Windows y en Linux.
+# - Al etiquetar vX.Y.Z: compila los instaladores (Windows: setup.exe; Linux: .deb y
+#   .AppImage), los firma y los publica en el Release de esa version junto con latest.json
+#   (lo que consultan las apps instaladas para actualizarse, en los dos sistemas).
 #
 #     git tag v0.2.0
 #     git push origin v0.2.0
@@ -32,7 +34,14 @@ on:
       - 'package-lock.json'
       - '.github/workflows/desktop.yml'
       - '.github/scripts/release.sh'
+  # A mano (Actions > Escritorio > Run workflow): con "instaladores" arma los instaladores de
+  # los dos sistemas sin publicar nada y los deja para bajar en el run (para probarlos).
   workflow_dispatch:
+    inputs:
+      instaladores:
+        description: Armar los instaladores (sin publicar)
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -43,11 +52,29 @@ concurrency:
 
 jobs:
   build:
-    name: Tests y build
-    runs-on: windows-latest
-    timeout-minutes: 40
+    name: Tests y build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            bundles: nsis
+          # 22.04 y no la ultima: el AppImage usa la glibc del sistema donde se compila, y
+          # asi arranca tambien en distros mas viejas.
+          - name: Linux
+            os: ubuntu-22.04
+            bundles: deb,appimage
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
+
+      - name: Dependencias de Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf build-essential file
 
       - uses: actions/setup-node@v4
         with:
@@ -57,7 +84,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Los tags solo pueden leer la cache de main: por eso main la deja con lo de
-      # release ya compilado (ver "Calentar cache") y el tag compila solo Ethereon.
+      # release ya compilado (ver "Calentar cache") y el tag compila solo Ethereon. La
+      # cache es una por sistema.
       - uses: Swatinem/rust-cache@v2
         with:
           # Workspace de Cargo en la raiz: target/ queda ahi.
@@ -80,25 +108,30 @@ jobs:
         working-directory: apps/desktop
         run: npx tauri build --no-bundle
 
-      - name: Version desde el tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      # La del tag; a mano, la que ya tiene el codigo.
+      - name: Version
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.instaladores
         id: version
         shell: bash
         run: |
-          V="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V=$(node -p 'require("./apps/desktop/src-tauri/tauri.conf.json").version')
+          fi
           if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "El tag '$GITHUB_REF_NAME' no tiene la forma vMAYOR.MENOR.PARCHE" >&2
+            echo "La version '$V' no tiene la forma MAYOR.MENOR.PARCHE" >&2
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: Instalador
+      - name: Instaladores
         if: steps.version.outputs.version
         shell: bash
         working-directory: apps/desktop
         env:
           # Clave privada de las actualizaciones (Settings > Secrets > Actions). Sin ella
-          # el instalador sale igual, pero las apps instaladas no se pueden actualizar solas.
+          # los instaladores salen igual, pero las apps instaladas no se pueden actualizar solas.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -108,32 +141,74 @@ jobs:
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then FIRMA=true; else FIRMA=false
             echo "::warning::Falta el secret TAURI_SIGNING_PRIVATE_KEY: esta version no se ofrece como actualizacion automatica."
           fi
-          npx tauri build --config "{\"version\":\"$V\",\"bundle\":{\"createUpdaterArtifacts\":$FIRMA}}"
+          npx tauri build --bundles ${{ matrix.bundles }} --config "{\"version\":\"$V\",\"bundle\":{\"createUpdaterArtifacts\":$FIRMA}}"
 
-      - name: Publicar el Release
+      # Los instaladores (y sus firmas) con nombres fijos, para el job que publica.
+      - name: Juntar instaladores
         if: steps.version.outputs.version
+        shell: bash
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          B=target/release/bundle
+          mkdir -p salida
+          copiar() { cp "$1" "salida/$2"; if [ -f "$1.sig" ]; then cp "$1.sig" "salida/$2.sig"; fi; }
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            copiar "$(ls $B/nsis/*-setup.exe)" "Ethereon-$V-setup.exe"
+          else
+            copiar "$(ls $B/appimage/*.AppImage)" "Ethereon-$V-amd64.AppImage"
+            copiar "$(ls $B/deb/*.deb)" "Ethereon-$V-amd64.deb"
+          fi
+          ls -la salida
+
+      - uses: actions/upload-artifact@v4
+        if: steps.version.outputs.version
+        with:
+          name: instaladores-${{ matrix.name }}
+          path: salida/
+          if-no-files-found: error
+
+  # Con los dos sistemas listos: latest.json con todas las plataformas y el Release.
+  release:
+    name: Publicar el Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: instaladores-*
+          path: salida
+          merge-multiple: true
+
+      - name: Publicar
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          V="${{ steps.version.outputs.version }}"
-          SETUP=$(ls target/release/bundle/nsis/*-setup.exe)
-          cp "$SETUP" "Ethereon-$V-setup.exe"
-          ARCHIVOS="Ethereon-$V-setup.exe"
-
-          # latest.json: lo que consultan las apps instaladas para actualizarse solas.
-          if [ -f "$SETUP.sig" ]; then
-            URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/Ethereon-$V-setup.exe"
+          V="${GITHUB_REF_NAME#v}"
+          cd salida
+          ls -la
+          # latest.json: lo que consultan las apps instaladas para actualizarse solas. El
+          # actualizador busca primero {os}-{arch}-{instalador} y despues {os}-{arch}.
+          if ls *.sig >/dev/null 2>&1; then
             node -e '
               const fs = require("fs");
-              const [v, url, sig] = process.argv.slice(1);
-              fs.writeFileSync("latest.json", JSON.stringify({
-                version: v,
-                pub_date: new Date().toISOString(),
-                platforms: { "windows-x86_64": { url, signature: fs.readFileSync(sig, "utf8").trim() } },
-              }, null, 2));
-            ' "$V" "$URL" "$SETUP.sig"
-            ARCHIVOS="$ARCHIVOS latest.json"
+              const [v, base] = process.argv.slice(1);
+              const p = {};
+              const add = (keys, file) => {
+                if (!fs.existsSync(file + ".sig")) return;
+                const entry = { url: `${base}/${file}`, signature: fs.readFileSync(file + ".sig", "utf8").trim() };
+                for (const k of keys) p[k] = entry;
+              };
+              add(["windows-x86_64", "windows-x86_64-nsis"], `Ethereon-${v}-setup.exe`);
+              add(["linux-x86_64", "linux-x86_64-appimage"], `Ethereon-${v}-amd64.AppImage`);
+              add(["linux-x86_64-deb"], `Ethereon-${v}-amd64.deb`);
+              fs.writeFileSync("latest.json", JSON.stringify({ version: v, pub_date: new Date().toISOString(), platforms: p }, null, 2));
+            ' "$V" "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+            cat latest.json
           fi
-
-          bash .github/scripts/release.sh "$V" $ARCHIVOS
+          # Las firmas solo van adentro de latest.json.
+          ARCHIVOS=$(ls | grep -v '\.sig$')
+          bash ../.github/scripts/release.sh "$V" $ARCHIVOS

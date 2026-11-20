@@ -47,10 +47,22 @@ pub fn play(name: &str, volume: u8) -> bool {
             PlaySoundW(PCWSTR(playing.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT).as_bool()
         }
     }
+    // Linux: el WAV va a un archivo temporal y lo toca paplay (PulseAudio / PipeWire) o, si
+    // no esta, aplay (ALSA). Sin esperar: suena mientras la app sigue.
     #[cfg(not(windows))]
     {
-        drop(buf);
-        false
+        drop(PLAYING.lock());
+        let path = std::env::temp_dir().join(format!("ethereon-{name}.wav"));
+        if std::fs::write(&path, &buf).is_err() {
+            return false;
+        }
+        ["paplay", "aplay"].iter().any(|player| {
+            let mut cmd = std::process::Command::new(player);
+            if *player == "aplay" {
+                cmd.arg("-q");
+            }
+            cmd.arg(&path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().is_ok()
+        })
     }
 }
 

@@ -4,8 +4,9 @@
 //!
 //! ICMP en Windows va por `IcmpSendEcho` (iphlpapi), que no necesita permisos de
 //! administrador y no depende del idioma de Windows como parsear `ping.exe`. Es lo mismo
-//! que usan `ping` y `tracert`. Solo IPv4. En otros sistemas (el servidor de la etapa 3)
-//! el ICMP devuelve `Unsupported` y queda lo de TCP.
+//! que usan `ping` y `tracert`. En Linux, por sockets ICMP sin root (como `ping` y
+//! `tracepath`). Solo IPv4. En otros sistemas el ICMP devuelve `Unsupported` y queda lo de
+//! TCP.
 
 use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -369,14 +370,185 @@ mod sys {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: sockets ICMP "ping" (SOCK_DGRAM + IPPROTO_ICMP), que no necesitan root si el
+/// grupo del usuario esta en `net.ipv4.ping_group_range` (asi viene en Ubuntu, Debian,
+/// Fedora y casi todas las de systemd). El kernel arma el identificador y filtra las
+/// respuestas de este socket. Los avisos de los routers (TTL vencido, inalcanzable) llegan
+/// por la cola de errores (`IP_RECVERR`), como en `tracepath`.
+#[cfg(target_os = "linux")]
+mod sys {
+    use super::Echo;
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::net::Ipv4Addr;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::time::{Duration, Instant};
+
+    static SEQ: AtomicU16 = AtomicU16::new(1);
+
+    fn setopt(fd: i32, level: i32, name: i32, value: libc::c_int) -> io::Result<()> {
+        let r = unsafe { libc::setsockopt(fd, level, name, &value as *const _ as *const libc::c_void, size_of::<libc::c_int>() as libc::socklen_t) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn from_sockaddr(sa: &libc::sockaddr_in) -> Ipv4Addr {
+        Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes())
+    }
+
+    pub fn echo(ip: Ipv4Addr, ttl: u8, timeout: Duration) -> io::Result<Echo> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMP) };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EPROTONOSUPPORT) => io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "this user can't send ping: allow it with `sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"`",
+                ),
+                _ => e,
+            });
+        }
+        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = sock.as_raw_fd();
+        setopt(fd, libc::IPPROTO_IP, libc::IP_TTL, ttl as libc::c_int)?;
+        setopt(fd, libc::IPPROTO_IP, libc::IP_RECVERR, 1)?;
+        setopt(fd, libc::IPPROTO_IP, libc::IP_RECVTTL, 1)?;
+
+        // Echo request: tipo 8, codigo 0; el kernel pone el identificador y el checksum.
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut pkt = [0x45u8; 8 + 32];
+        pkt[..8].copy_from_slice(&[8, 0, 0, 0, 0, 0, 0, 0]);
+        pkt[6..8].copy_from_slice(&seq.to_be_bytes());
+        let mut to: libc::sockaddr_in = unsafe { zeroed() };
+        to.sin_family = libc::AF_INET as libc::sa_family_t;
+        to.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
+        let started = Instant::now();
+        let sent = unsafe {
+            libc::sendto(fd, pkt.as_ptr() as *const libc::c_void, pkt.len(), 0, &to as *const _ as *const libc::sockaddr, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        };
+        if sent < 0 {
+            let e = io::Error::last_os_error();
+            // Sin ruta (red caida): para el traceroute es "no contesto".
+            if matches!(e.raw_os_error(), Some(libc::ENETUNREACH) | Some(libc::EHOSTUNREACH)) {
+                return Ok(Echo::Timeout);
+            }
+            return Err(e);
+        }
+
+        let mut buf = [0u8; 1500];
+        let mut ctrl = [0u8; 512];
+        loop {
+            let left = timeout.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Ok(Echo::Timeout);
+            }
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let r = unsafe { libc::poll(&mut pfd, 1, left.as_millis().clamp(1, i32::MAX as u128) as i32) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if r == 0 {
+                return Ok(Echo::Timeout);
+            }
+            let errq = pfd.revents & libc::POLLERR != 0;
+            let mut from: libc::sockaddr_in = unsafe { zeroed() };
+            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+            let mut msg: libc::msghdr = unsafe { zeroed() };
+            msg.msg_name = &mut from as *mut _ as *mut libc::c_void;
+            msg.msg_namelen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = ctrl.len() as _;
+            let n = unsafe { libc::recvmsg(fd, &mut msg, if errq { libc::MSG_ERRQUEUE } else { 0 }) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) {
+                    continue;
+                }
+                return Err(e);
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let n = n as usize;
+            // En los dos casos el paquete trae la cabecera ICMP: la nuestra (en la cola de
+            // errores) o la respuesta. Que sea de este envio.
+            if n < 8 || buf[6..8] != seq.to_be_bytes() {
+                continue;
+            }
+            let mut reply_ttl = 0u8;
+            let mut err: Option<(libc::sock_extended_err, Ipv4Addr)> = None;
+            unsafe {
+                let mut c = libc::CMSG_FIRSTHDR(&msg);
+                while !c.is_null() {
+                    let h = &*c;
+                    if h.cmsg_level == libc::IPPROTO_IP && h.cmsg_type == libc::IP_TTL {
+                        reply_ttl = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::c_int) as u8;
+                    } else if h.cmsg_level == libc::IPPROTO_IP && h.cmsg_type == libc::IP_RECVERR {
+                        let ee = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::sock_extended_err);
+                        // El que aviso (SO_EE_OFFENDER) va justo despues de la estructura.
+                        let off = std::ptr::read_unaligned((libc::CMSG_DATA(c) as *const libc::sock_extended_err).add(1) as *const libc::sockaddr_in);
+                        err = Some((ee, from_sockaddr(&off)));
+                    }
+                    c = libc::CMSG_NXTHDR(&msg, c);
+                }
+            }
+            if errq {
+                let Some((ee, who)) = err else { continue };
+                if ee.ee_origin != libc::SO_EE_ORIGIN_ICMP {
+                    continue;
+                }
+                return Ok(match ee.ee_type {
+                    11 => Echo::Expired { from: who, ms },
+                    3 => Echo::Unreachable { from: who },
+                    _ => continue,
+                });
+            }
+            // Echo reply: tipo 0.
+            if buf[0] == 0 {
+                return Ok(Echo::Reply { from: from_sockaddr(&from), ms, ttl: reply_ttl });
+            }
+        }
+    }
+
+    pub fn reverse(ip: Ipv4Addr) -> Option<String> {
+        let mut sa: libc::sockaddr_in = unsafe { zeroed() };
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
+        let mut host = [0 as libc::c_char; 1025];
+        let rc = unsafe {
+            libc::getnameinfo(
+                &sa as *const _ as *const libc::sockaddr,
+                size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                host.as_mut_ptr(),
+                host.len() as libc::socklen_t,
+                std::ptr::null_mut(),
+                0,
+                libc::NI_NAMEREQD,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
+        Some(s.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod sys {
     use super::Echo;
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
     pub fn echo(_ip: Ipv4Addr, _ttl: u8, _timeout: Duration) -> std::io::Result<Echo> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "ICMP is only available on Windows for now"))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "ICMP is only available on Windows and Linux for now"))
     }
 
     pub fn reverse(_ip: Ipv4Addr) -> Option<String> {
@@ -435,7 +607,7 @@ mod tests {
     }
 
     /// Contra internet: `cargo test -p ethereon-core diag -- --ignored --nocapture`.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[tokio::test]
     #[ignore]
     async fn trace_internet() {
@@ -453,10 +625,14 @@ mod tests {
         assert!(hops.last().unwrap().last, "did not reach {ip}");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn ping_localhost() {
-        let e = echo(Ipv4Addr::LOCALHOST, 64, Duration::from_secs(1)).unwrap();
-        assert!(matches!(e, Echo::Reply { .. }), "{e:?}");
+        match echo(Ipv4Addr::LOCALHOST, 64, Duration::from_secs(1)) {
+            Ok(e) => assert!(matches!(e, Echo::Reply { .. }), "{e:?}"),
+            // Un Linux que no deja ping sin root (ping_group_range): no es un error del codigo.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => eprintln!("ping not allowed here: {e}"),
+            Err(e) => panic!("{e}"),
+        }
     }
 }
